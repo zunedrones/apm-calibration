@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Calibração APM 2.x · Zune Drones</title>
+  <link rel="icon" href="/static/img/favicon.png">
+  <link rel="stylesheet" href="/static/style.css?v=6">
+</head>
+<body>
+  <header class="top">
+    <div class="brand">
+      <img src="/static/img/zune-logo-white.png" alt="Zune Drones">
+      <div>
+        <h1>Calibração APM 2.x</h1>
+        <small>ArduCopter 3.2 · Zune Drones · UFRN</small>
+      </div>
+    </div>
+    <div class="conn">
+      <span class="pill" id="pill-mode" hidden></span>
+      <span class="pill" id="pill-armed" hidden>ARMADO</span>
+      <span class="pill" id="pill-conn"><span class="dot"></span><span>Desconectado</span></span>
+      <select id="port-select" title="Porta serial"></select>
+      <button class="light" id="btn-connect">Conectar</button>
+    </div>
+  </header>
+
+  <div class="layout">
+    <nav class="steps" id="nav"></nav>
+    <main id="main"></main>
+  </div>
+  <div class="toast" id="toast"></div>
+
+  <script src="/static/app.js?v=6"></script>
+</body>
+</html>

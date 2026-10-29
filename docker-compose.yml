@@ -1,0 +1,16 @@
+services:
+  apm-web:
+    build: .
+    image: zune/apm-calibration
+    container_name: apm-calibration
+    network_mode: host        # interface em http://localhost:8080
+    privileged: true          # acesso à USB mesmo se a placa for plugada depois
+    volumes:
+      - /dev:/dev
+      - ./app:/opt/apm/app    # edição ao vivo do código
+      - ./backup:/opt/apm/backup
+    environment:
+      APM_PORT: /dev/ttyACM0
+      APM_BAUD: "115200"
+      APM_AUTOCONNECT: "0"    # 1 = conecta ao subir (abrir a USB reinicia a placa)
+    restart: unless-stopped
