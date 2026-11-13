@@ -23,6 +23,8 @@ const fx = (v, d = 1) => (v === undefined || v === null || Number.isNaN(v) ? "�
 const P = (n) => S.params[n];
 // família de firmware conectada: "ac32" (APM 2.x) ou "ac4" (Pixhawk)
 const is4 = () => (S.snap.board || S.meta?.board) === "ac4";
+// canal da chave de modos: fixo no 5 no 3.2, FLTMODE_CH no 4.x
+const modeCh = () => (is4() && P("FLTMODE_CH") >= 5 ? P("FLTMODE_CH") : 5);
 const B = (apm, px) => (is4() ? px : apm);
 const OUT = () => B("saída", "MAIN OUT");
 const BOARD = () => B("APM", "Pixhawk");
@@ -571,6 +573,8 @@ function decodeMagId(id) {
 const magDetected = () => [...new Set(["", 2, 3, 4, 5, 6, 7, 8].map((i) => P(`COMPASS_DEV_ID${i}`)).filter((x) => x))];
 const MAGST = { 0: "não começou", 1: "aguardando", 2: "girando: passo 1", 3: "girando: passo 2", 4: "ok", 5: "falhou", 6: "orientação ruim", 7: "raio ruim (interferência)" };
 function UPDATE_COMPASS4() {
+  // página desenhada para a APM antes de a placa ser identificada
+  if (!$("#cp-prio")) return go("compass");
   const s = S.snap, c = s.compass || {};
   const mag = sensor("SENSOR_3D_MAG");
   const found = magDetected();
@@ -649,6 +653,14 @@ UPDATE.gps = () => {
 
 // ---------------------------------------------------------------- rádio
 const RC_NAMES = ["Roll (aileron)", "Pitch (profundor)", "Throttle", "Yaw (leme)", "Modo de voo", "Ch 6 (tuning)", "Ch 7 (aux)", "Ch 8 (aux)"];
+// nome do canal pela função configurada (modos / RCn_OPTION no 4.x)
+function rcName(i) {
+  if (i < 4) return RC_NAMES[i];
+  if (i === modeCh() - 1) return "Modo de voo";
+  const opt = is4() ? P(`RC${i + 1}_OPTION`) : 0;
+  if (opt > 0) return AUX_OPTIONS[opt] || `opção ${opt}`;
+  return is4() ? `Ch ${i + 1} (livre)` : RC_NAMES[i];
+}
 const RC_HINT = ["Stick à direita → aumenta", "Stick para FRENTE (cima) → DIMINUI", "Stick para cima → aumenta", "Stick à direita → aumenta", "Chave de 3/6 posições", "", "", ""];
 const RC_DIR = [1, -1, 1, 1]; // sinal de (PWM - trim) para direita / frente / cima / direita
 RENDER.radio = () => `
@@ -659,9 +671,9 @@ RENDER.radio = () => `
     <p class="muted" style="font-size:13px">Verde = trim gravado (RCn_TRIM), amarelo = mínimo e máximo gravados. Se uma direção estiver invertida, inverta o canal <b>no transmissor</b>.</p></div>
   <div class="card accent"><h3>Calibração</h3><div id="rc-cal"></div></div>`;
 BIND.radio = (el) => {
-  $("#rc-bars", el).innerHTML = RC_NAMES.map((n, i) => `<div class="rc-row"><div><b>CH${i + 1}</b> <span class="muted">${n}</span></div>
+  $("#rc-bars", el).innerHTML = RC_NAMES.map((n, i) => `<div class="rc-row"><div><b>CH${i + 1}</b> <span class="muted">${rcName(i)}</span></div>
     <div class="bar" id="rcb${i}"><div class="fill"></div><div class="mark" data-m="min"></div><div class="mark" data-m="max"></div><div class="mark trim" data-m="trim"></div><div class="lbl"><span></span><span></span></div></div>
-    <div class="hint muted" id="rch${i}">${RC_HINT[i]}</div></div>`).join("");
+    <div class="hint muted" id="rch${i}">${i === modeCh() - 1 ? RC_HINT[4] : i < 4 ? RC_HINT[i] : ""}</div></div>`).join("");
   $("#rc-cal", el).addEventListener("click", (e) => {
     const b = e.target.closest("button[data-act]");
     if (!b) return;
@@ -701,9 +713,9 @@ UPDATE.radio = () => {
       const name = i === 1 ? (up ? "frente" : "trás") : i === 2 ? (v > tr ? "cima" : "baixo") : up ? "direita" : "esquerda";
       $(`#rch${i}`).innerHTML = `${RC_HINT[i]}<br>a placa entende: <b>${name}</b>`;
     } else if (i < 4) $(`#rch${i}`).textContent = RC_HINT[i];
-    if (i === 4) {
+    if (i === modeCh() - 1) {
       const slot = fltSlot(v);
-      $(`#rch4`).innerHTML = `Posição ${slot} → <b>${S.meta?.modes?.[P(`FLTMODE${slot}`)] ?? "?"}</b>`;
+      $(`#rch${i}`).innerHTML = `Posição ${slot} → <b>${S.meta?.modes?.[P(`FLTMODE${slot}`)] ?? "?"}</b>`;
     }
   });
   const el = $("#rc-cal");
@@ -711,7 +723,7 @@ UPDATE.radio = () => {
   if (cal.state === "capturing") html = `<ol class="steps-list"><li><b>Mova todos os sticks até o fim do curso</b>Círculos completos nos dois sticks e todas as chaves (CH5–CH8) nas posições extremas. As marcas amarelas mostram o que já foi capturado.</li>
       <li><b>Volte os sticks ao centro e o throttle todo para baixo</b>Então clique em terminar.</li></ol><div class="row"><button data-act="finish">Terminar captura</button><button class="secondary" data-act="reset">Cancelar</button></div>`;
   else if (cal.state === "captured") html = `<table><thead><tr><th>Canal</th><th class="num">Mín</th><th class="num">Trim</th><th class="num">Máx</th><th class="num">Curso</th></tr></thead><tbody>
-      ${cal.mins.map((mn, i) => { const sp = cal.maxs[i] - mn; return `<tr><td>CH${i + 1} ${RC_NAMES[i]}</td><td class="num">${mn}</td><td class="num">${i === 2 ? mn : cal.trims[i]}</td><td class="num">${cal.maxs[i]}</td><td class="num">${sp > 0 ? sp : "—"}${sp < 200 ? " (não alterado)" : ""}</td></tr>`; }).join("")}
+      ${cal.mins.map((mn, i) => { const sp = cal.maxs[i] - mn; return `<tr><td>CH${i + 1} ${rcName(i)}</td><td class="num">${mn}</td><td class="num">${i === 2 ? mn : cal.trims[i]}</td><td class="num">${cal.maxs[i]}</td><td class="num">${sp > 0 ? sp : "—"}${sp < 200 ? " (não alterado)" : ""}</td></tr>`; }).join("")}
       </tbody></table><div class="row" style="margin-top:12px"><button data-act="save">Gravar na placa</button><button class="secondary" data-act="start">Refazer</button><button class="secondary" data-act="reset">Cancelar</button></div>`;
   else html = `<div class="row"><span class="muted">${radioCalibrated() ? "Já existe uma calibração gravada. Refaça se trocou de rádio ou de receptor." : "O rádio não está calibrado."}</span><span class="spacer"></span><button data-act="start" ${receiverPresent() ? "" : "disabled"}>Iniciar calibração</button></div>`;
   if (el.dataset.html !== html) { el.innerHTML = html; el.dataset.html = html; }
@@ -731,12 +743,23 @@ const MODE_HELP = {
   BRAKE: "Para no ar (GPS).", SMART_RTL: "Volta pelo caminho percorrido (GPS).", GUIDED_NOGPS: "Comandado sem GPS.", FLOWHOLD: "Segura posição por optical flow.",
   THROW: "Lança com a mão (GPS).", FOLLOW: "Segue outro veículo (GPS).", ZIGZAG: "Pulverização em zigue-zague (GPS).", AUTO_RTL: "Missão até o pouso (GPS).", TURTLE: "Desvira o drone.",
 };
-const MODE_PRESETS = { no_gps: [0, 0, 2, 2, 9, 9], gps: [0, 2, 5, 16, 6, 9] };
+// chave de 3 posições cai nas posições 1, 4 e 6: STABILIZE / ALT_HOLD / LOITER (ou LAND sem GPS)
+const MODE_PRESETS = { no_gps: [0, 0, 2, 2, 9, 9], gps: [0, 0, 2, 2, 5, 5] };
+// RCn_OPTION mais usados (ArduCopter 4.x)
+const AUX_OPTIONS = { 0: "nada", 4: "RTL (volta para casa)", 17: "AutoTune (ajuste de PID)", 18: "LAND", 42: "SmartRTL",
+  3: "Modo simples", 9: "Disparo de câmera", 31: "Parada de emergência dos motores", 33: "Brake" };
+const AUX_HELP = {
+  17: "Em voo, em ALT_HOLD, LOITER ou POSHOLD: chave para cima inicia o ajuste automático de PID. Chave para baixo volta aos PIDs antigos. Para gravar os novos, pouse e desarme com a chave ainda para cima.",
+  4: "Chave para cima: volta para o ponto de decolagem e pousa. Precisa de GPS.", 31: "Chave para cima: corta os motores na hora (mesmo em voo).",
+};
 RENDER.modes = () => `
   <h2>Modos de voo</h2>
-  <p class="lead">O canal 5 escolhe entre 6 modos. Mude a chave do transmissor e veja qual posição acende. Sem GPS, use só modos que não dependem de posição.</p>
+  <p class="lead">O canal ${modeCh()} escolhe entre 6 modos. Uma chave de 3 posições usa só as posições 1, 4 e 6. Mude a chave do transmissor e veja qual posição acende. Sem GPS, use só modos que não dependem de posição.</p>
   <div class="card accent"><div class="modes" id="fm-slots"></div>
-    <div class="row" style="margin-top:14px"><button id="fm-save">Gravar modos</button><button class="secondary" id="fm-preset">Usar sugestão (${cfgMode() === "gps" ? "com GPS" : "sem GPS"})</button><span class="spacer"></span><span class="muted" id="fm-now"></span></div></div>`;
+    <div class="row" style="margin-top:14px"><button id="fm-save">Gravar modos</button><button class="secondary" id="fm-preset">Usar sugestão (${cfgMode() === "gps" ? "com GPS" : "sem GPS"})</button><span class="spacer"></span><span class="muted" id="fm-now"></span></div></div>
+  ${is4() ? `<div class="card"><h3>Chaves do rádio</h3><p class="muted">Escolha qual canal troca os modos e o que as outras chaves fazem.</p>
+    <div class="row"><label class="field">Canal dos modos (FLTMODE_CH)<select id="fm-ch">${[5, 6, 7, 8].map((c) => `<option value="${c}">CH${c}</option>`).join("")}</select></label></div>
+    <div id="fm-aux"></div><div class="row" style="margin-top:12px"><button id="fm-aux-save">Gravar chaves</button></div></div>` : ""}`;
 BIND.modes = (el) => {
   const opts = Object.entries(S.meta?.modes || {}).map(([k, v]) => `<option value="${k}">${k}: ${v}</option>`).join("");
   $("#fm-slots", el).innerHTML = [1, 2, 3, 4, 5, 6].map((i) => { const [a, b] = S.meta?.fltmode_pwm?.[i - 1] || [0, 0]; return `<div class="slot" data-slot="${i}"><b>Posição ${i}</b><span class="muted mono">${a}–${b}</span><div class="row"><select data-fm="${i}">${opts}</select><span class="muted" data-fmh="${i}"></span></div></div>`; }).join("");
@@ -750,12 +773,39 @@ BIND.modes = (el) => {
   $$("[data-fm]", el).forEach((s) => (s.onchange = () => help(s)));
   $("#fm-preset", el).onclick = () => { const p = MODE_PRESETS[cfgMode() === "gps" ? "gps" : "no_gps"]; $$("[data-fm]", el).forEach((s, i) => { s.value = String(p[i]); help(s); }); toast("Sugestão carregada. Clique em Gravar."); };
   $("#fm-save", el).onclick = (e) => run(e.target, () => setParams(Object.fromEntries($$("[data-fm]", el).map((s) => [`FLTMODE${s.dataset.fm}`, +s.value])), "Modos de voo"));
+  if (!is4()) return;
+  const ch = $("#fm-ch", el);
+  const auxOpts = Object.entries(AUX_OPTIONS).map(([k, v]) => `<option value="${k}">${k}: ${v}</option>`).join("");
+  const drawAux = () => {
+    const keep = Object.fromEntries($$("[data-aux]", el).map((s) => [s.dataset.aux, s.value]));
+    $("#fm-aux", el).innerHTML = [5, 6, 7, 8].filter((c) => c !== +ch.value).map((c) => {
+      const cur = String(keep[c] ?? P(`RC${c}_OPTION`) ?? 0);
+      const extra = AUX_OPTIONS[cur] === undefined ? `<option value="${cur}">${cur}: outra</option>` : "";
+      return `<div class="row"><label class="field">CH${c} (RC${c}_OPTION)<select data-aux="${c}">${auxOpts}${extra}</select></label><span class="muted" data-auxh="${c}"></span></div>`;
+    }).join("");
+    $$("[data-aux]", el).forEach((s) => {
+      s.value = keep[s.dataset.aux] ?? String(P(`RC${s.dataset.aux}_OPTION`) ?? 0);
+      const h = () => ($(`[data-auxh="${s.dataset.aux}"]`, el).textContent = AUX_HELP[s.value] || "");
+      s.onchange = h; h();
+    });
+  };
+  ch.value = String(modeCh());
+  ch.onchange = drawAux;
+  drawAux();
+  $("#fm-aux-save", el).onclick = (e) => run(e.target, async () => {
+    // o canal dos modos não pode ter outra função ao mesmo tempo
+    const obj = { FLTMODE_CH: +ch.value, [`RC${ch.value}_OPTION`]: 0 };
+    $$("[data-aux]", el).forEach((s) => (obj[`RC${s.dataset.aux}_OPTION`] = +s.value));
+    await setParams(obj, "Chaves do rádio");
+    go("modes");
+  });
 };
 UPDATE.modes = () => {
-  const ch5 = S.snap.rc?.[4];
-  const slot = ch5 ? fltSlot(ch5) : 0;
+  const c = modeCh();
+  const pwm = S.snap.rc?.[c - 1];
+  const slot = pwm ? fltSlot(pwm) : 0;
   $$(".slot").forEach((d) => d.classList.toggle("active", +d.dataset.slot === slot));
-  $("#fm-now").textContent = S.snap.connected ? `CH5 = ${ch5 ?? "—"} µs · modo atual: ${S.snap.mode ?? "—"}` : "";
+  $("#fm-now").textContent = S.snap.connected ? `CH${c} = ${pwm ?? "—"} µs · modo atual: ${S.snap.mode ?? "—"}` : "";
 };
 
 // ---------------------------------------------------------------- failsafe
