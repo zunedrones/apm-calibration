@@ -2,8 +2,12 @@
 
 # apm-calibration
 
-Interface web para **diagnosticar, calibrar e deixar pronta para voo** a controladora **APM 2.x
-(ArduPilot Mega 2.5/2.6) com ArduCopter 3.2.1**, o último firmware que roda nessa placa.
+Interface web para **diagnosticar, calibrar e deixar pronta para voo** uma controladora ArduCopter:
+
+- **APM 2.x** (ArduPilot Mega 2.5/2.6) com **ArduCopter 3.2.1**, o último firmware que roda nessa placa;
+- **Pixhawk** (FMUv2/v3 e outras placas ChibiOS) com **ArduCopter 4.x** (testado no 4.5.7).
+
+A interface reconhece a família na conexão (AUTOPILOT_VERSION / MAVLink 2) e adapta cada etapa.
 Tudo roda em Docker; a interface conversa com a placa por MAVLink pela USB.
 
 Equipe Zune Drones · UFRN.
@@ -14,7 +18,7 @@ Equipe Zune Drones · UFRN.
 docker compose up -d --build
 ```
 
-Abra <http://localhost:8080>, escolha a porta (`ttyACM0 · APM (Mega 2560)`) e clique em **Conectar**.
+Abra <http://localhost:8080>, escolha a porta (`ttyACM0 · APM 2.x (Mega 2560)` ou `ttyACM0 · Pixhawk`) e clique em **Conectar**.
 
 - Abrir a USB **reinicia a placa** (DTR do ATmega2560). Deixe-a parada por ~5 s enquanto o giroscópio calibra.
 - Só um programa pode usar a serial: clique em **Desconectar** antes de abrir o APM Planner ou o Mission Planner.
@@ -41,6 +45,20 @@ Abra <http://localhost:8080>, escolha a porta (`ttyACM0 · APM (Mega 2560)`) e c
 Cada etapa tem um indicador na barra lateral (verde/amarelo/vermelho). Confirmações manuais (ESCs, motores,
 teste de failsafe, itens do checklist) ficam salvas no navegador.
 
+## O que muda entre as placas
+
+| Etapa | APM 2.x · ArduCopter 3.2 | Pixhawk · ArduCopter 4.x |
+|---|---|---|
+| Acelerômetro | placa trava; posições por STATUSTEXT + COMMAND_ACK | placa pede cada posição com `ACCELCAL_VEHICLE_POS` e o GCS confirma |
+| Bússola | ajuste de esfera feito aqui (RAW_IMU) | calibração na placa (`DO_START_MAG_CAL`, progresso por bússola, gravar com `DO_ACCEPT_MAG_CAL`); lista de prioridade `COMPASS_PRIOn_ID` decodificada |
+| GPS ou sem GPS | `MAG_ENABLE`, `ARMING_CHECK=-5` | `COMPASS_ENABLE/USE`, fontes do EKF3 (`EK3_SRC1_*`), `ARMING_CHECK=1` |
+| PreArm | escuta o reenvio de 30 s | bit `PREARM_CHECK` do SYS_STATUS + `RUN_PREARM_CHECKS` |
+| ESCs | todos de uma vez pelo throttle do rádio | `ESC_CALIBRATION=3` (automática) + chave de segurança; DShot dispensa |
+| Bateria | pinos 13/12, `FS_BATT_*` | pinos 2/3, `BATT_AMP_PERVLT`, `BATT_LOW_*`, `BATT_FS_LOW_ACT` (exige reboot após `BATT_MONITOR`) |
+| Motores | saídas 1–4 | MAIN OUT 1–4, exige a chave de segurança liberada |
+
+O envio é sempre em MAVLink 1 (as duas placas entendem); a recepção usa o dialeto MAVLink 2.
+
 ## Particularidades da APM 2.x / ArduCopter 3.2 (aprendidas na prática)
 
 - **`ARMING_CHECK` é int8.** Valores > 127 saturam. "Tudo menos bússola" é `-5` (0xFB), não 250.
@@ -57,6 +75,15 @@ teste de failsafe, itens do checklist) ficam salvas no navegador.
   relendo `INS_ACC*` (testado em `tests/test_accelcal.py`).
 - **Sem receptor, o CH3 fica em ~900 µs** (valor do encoder PPM da APM 2.x), abaixo de `FS_THR_VALUE`.
 - **USB = 115200 baud**, rádio de telemetria = 57600.
+
+## Particularidades da Pixhawk / ArduCopter 4.x
+
+- **Bússola "com falha" com uma bússola ligada:** a placa lembra bússolas de montagens antigas em
+  `COMPASS_PRIOn_ID`. Se a da prioridade 1 sumiu, o campo fica em 0 e a calibração é recusada
+  ("Compass #0 … removed"). A página Bússola mostra a lista decodificada e reordena com um clique.
+- **Chave de segurança:** sem liberá-la (LED vermelho fixo) não há teste de motor nem calibração de ESC.
+- **`ARMING_CHECK=0`** é sinalizado como alerta: a placa arma sem conferir nada e não diz por que falha no PreArm.
+- **Reiniciar** faz a USB sumir e voltar; a interface espera a porta e reconecta.
 
 ## Scripts de linha de comando (`scripts/`)
 
@@ -86,9 +113,10 @@ docker run --rm -v "$PWD":/opt/apm zune/apm-calibration python -m pytest -q test
 ```
 app/
   main.py      API HTTP + WebSocket (FastAPI)
-  vehicle.py   conexão MAVLink, parâmetros e máquinas de estado (acelerômetro, bússola, rádio)
-  magfit.py    ajuste de esfera e métricas da bússola
+  vehicle.py   conexão MAVLink, detecção da placa, parâmetros e máquinas de estado (acelerômetro, bússola, rádio)
+  magfit.py    ajuste de esfera e métricas da bússola (APM 2.x)
   ardu32.py    constantes do ArduCopter 3.2 (modos, frames, presets, ordem dos motores)
+  ardu4.py     constantes do ArduCopter 4.x (Pixhawk)
   static/      interface (HTML/CSS/JS sem build, funciona offline)
 backup/        parâmetros da placa da equipe (veja backup/README.md)
 docs/          registro do diagnóstico de 2026-10-29

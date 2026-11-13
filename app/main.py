@@ -1,4 +1,4 @@
-"""API HTTP + WebSocket da interface de calibração."""
+"""API HTTP + WebSocket da interface de calibração (APM 2.x e Pixhawk)."""
 from __future__ import annotations
 
 import asyncio
@@ -15,7 +15,7 @@ from pydantic import BaseModel
 from pymavlink import mavutil
 from serial.tools import list_ports
 
-from . import ardu32
+from . import ardu4, ardu32
 from .vehicle import Vehicle, VehicleError
 
 M = mavutil.mavlink
@@ -36,7 +36,7 @@ async def lifespan(_: FastAPI):
     veh.disconnect()
 
 
-app = FastAPI(title="Zune Drones — Calibração APM 2.x", lifespan=lifespan)
+app = FastAPI(title="Zune Drones — Calibração de controladoras", lifespan=lifespan)
 
 
 def guard(fn, *a, **kw) -> Any:
@@ -59,8 +59,16 @@ def ports() -> list[dict]:
         if not (p.device.startswith(("/dev/ttyACM", "/dev/ttyUSB")) or p.vid):
             continue
         out.append({"device": p.device, "description": p.description, "vid": p.vid, "pid": p.pid,
-                    "apm": p.vid == 0x2341 and p.pid == 0x0010})
-    return sorted(out, key=lambda d: (not d["apm"], d["device"]))
+                    "kind": board_kind(p.vid, p.pid), "apm": p.vid == 0x2341 and p.pid == 0x0010})
+    return sorted(out, key=lambda d: (d["kind"] is None, d["device"]))
+
+
+def board_kind(vid: int | None, pid: int | None) -> str | None:
+    if vid == 0x2341 and pid == 0x0010:
+        return "apm"  # ATmega32U2 da APM 2.x (se apresenta como Arduino Mega 2560)
+    if vid in (0x1209, 0x26AC, 0x2DAE, 0x3162) or (vid == 0x0483 and pid == 0x5740):
+        return "pixhawk"  # ArduPilot/ChibiOS, 3DR, CubePilot, Holybro, STM32 genérico
+    return None
 
 
 @app.post("/api/connect")
@@ -82,11 +90,15 @@ def reboot() -> dict:
 
 
 @app.get("/api/meta")
-def meta() -> dict:
+def meta(board: str | None = None) -> dict:
+    """Constantes da família de firmware conectada (ou da pedida em ?board=ac32|ac4)."""
+    p = {"ac32": ardu32, "ac4": ardu4}.get(board or "", veh.profile)
     return {
-        "modes": ardu32.FLIGHT_MODES, "gps_modes": sorted(ardu32.GPS_MODES), "fltmode_pwm": ardu32.FLTMODE_PWM,
-        "frames": ardu32.FRAMES, "motor_layout": ardu32.MOTOR_TEST_LAYOUT, "presets": ardu32.PRESETS,
-        "arming_bits": ardu32.ARMING_CHECK_BITS, "power_module": ardu32.APM2_POWER_MODULE,
+        "board": p.KEY, "label": p.LABEL,
+        "modes": p.FLIGHT_MODES, "gps_modes": sorted(p.GPS_MODES), "fltmode_pwm": p.FLTMODE_PWM,
+        "frames": p.FRAMES, "frame_param": p.FRAME_PARAM, "motor_layout": p.MOTOR_TEST_LAYOUT, "presets": p.PRESETS,
+        "arming_bits": p.ARMING_CHECK_BITS, "power_module": p.POWER_MODULE, "battery": p.BATTERY,
+        "fs_thr_options": p.FS_THR_OPTIONS, "esc_params": p.ESC_PARAMS,
     }
 
 
@@ -125,7 +137,7 @@ def params_export() -> PlainTextResponse:
     if not veh.params:
         raise HTTPException(400, "Nenhum parâmetro carregado.")
     body = "".join(f"{k},{v:.7g}\n" for k, v in sorted(veh.params.items()))
-    name = time.strftime("apm2-params-%Y%m%d-%H%M%S.param")
+    name = time.strftime(f"{'pixhawk' if veh.is4 else 'apm2'}-params-%Y%m%d-%H%M%S.param")
     return PlainTextResponse(body, headers={"Content-Disposition": f'attachment; filename="{name}"'})
 
 
@@ -153,8 +165,9 @@ def params_diff(req: ImportReq) -> dict:
     if not new:
         raise HTTPException(400, "Arquivo sem parâmetros válidos.")
     changes, unknown, skipped = [], [], []
+    p = veh.profile
     for k, v in sorted(new.items()):
-        if k in ardu32.PARAMS_SKIP_RESTORE or k.startswith(ardu32.PARAMS_SKIP_RESTORE_PREFIX):
+        if k in p.PARAMS_SKIP_RESTORE or k.startswith(p.PARAMS_SKIP_RESTORE_PREFIX) or p.PARAMS_SKIP_RESTORE_RE.search(k):
             skipped.append(k)
         elif k not in veh.params:
             unknown.append(k)
@@ -166,12 +179,14 @@ def params_diff(req: ImportReq) -> dict:
 # ----------------------------------------------------------------- presets
 @app.post("/api/preset/{name}")
 def preset(name: str) -> dict:
-    if name not in ardu32.PRESETS:
+    p = veh.profile
+    if name not in p.PRESETS:
         raise HTTPException(404, "Preset desconhecido.")
-    values = ardu32.PRESETS[name]
+    # parâmetros que não existem nesta placa (ex.: COMPASS_USE3 sem 3ª bússola) ficam de fora
+    values = {k: v for k, v in p.PRESETS[name].items() if k in veh.params}
     changed = {k for k, v in values.items() if veh.params.get(k) != v}
     res = veh.set_params(values)
-    return {"results": res, "needs_reboot": bool(changed & ardu32.PRESET_NEEDS_REBOOT)}
+    return {"results": res, "needs_reboot": bool(changed & p.PRESET_NEEDS_REBOOT)}
 
 
 # ------------------------------------------------------------- calibrações
@@ -186,7 +201,11 @@ def accel(action: str) -> dict:
 
 @app.post("/api/compass/{action}")
 def compass(action: str) -> Any:
-    acts = {"start": veh.compass.start, "stop": veh.compass.stop, "apply": veh.compass.apply, "reset": veh.compass.reset}
+    c = veh.compass
+    if veh.is4:  # calibração na placa
+        acts = {"start": c.start, "accept": c.accept, "reset": c.cancel}
+    else:        # calibração aqui (ajuste de esfera)
+        acts = {"start": c.start, "stop": c.stop, "apply": c.apply, "reset": c.reset}
     if action not in acts:
         raise HTTPException(404)
     out = guard(acts[action])
@@ -227,10 +246,19 @@ def motor_test(req: MotorTestReq) -> dict:
     if not 1 <= req.motor <= 8 or not 0 < req.throttle <= 30 or not 0 < req.duration <= 5:
         raise HTTPException(400, "Valores fora da faixa segura (throttle até 30 %, até 5 s).")
     guard(veh.require_disarmed)
+    if veh.is4 and not veh.snapshot().get("safety_off", True):
+        raise HTTPException(400, "Chave de segurança ativa: segure o botão da Pixhawk até o LED ficar vermelho fixo (ou BRD_SAFETY_DEFLT=0).")
     # MAV_CMD_DO_MOTOR_TEST: p1 sequência, p2 tipo (0 = %), p3 valor, p4 timeout
     result = guard(veh.command_wait_ack, M.MAV_CMD_DO_MOTOR_TEST, req.motor, 0, req.throttle, req.duration, timeout=3)
     msgs = [t for ts, _, t in veh.texts if t.startswith("Motor Test") and time.time() - ts < 4]
     return {"result": result, "ok": result == M.MAV_RESULT_ACCEPTED, "messages": msgs}
+
+
+@app.post("/api/prearm")
+def prearm_now() -> dict:
+    """4.x: pede a lista de PreArm na hora, em vez de esperar o reenvio de 30 s."""
+    guard(veh.run_prearm_checks)
+    return veh.prearm()
 
 
 # --------------------------------------------------------------- telemetria

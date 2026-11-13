@@ -1,24 +1,35 @@
-"""Conexão MAVLink com a APM 2.x (ArduCopter 3.2) e máquinas de estado das calibrações.
+"""Conexão MAVLink com a controladora e máquinas de estado das calibrações.
+
+Duas famílias de firmware, detectadas na conexão:
+- APM 2.x com ArduCopter 3.2 (`ardu32`): MAVLink 1, a placa trava durante a calibração do
+  acelerômetro e a bússola é calibrada aqui no GCS;
+- Pixhawk com ArduCopter 4.x (`ardu4`): MAVLink 2, acelerômetro e bússola calibrados pela
+  própria placa (ACCELCAL_VEHICLE_POS, MAG_CAL_PROGRESS/REPORT).
 
 Uma única thread lê a serial e guarda a última mensagem de cada tipo; a API e o
-WebSocket só leem esse estado. Envio é protegido por lock.
+WebSocket só leem esse estado. Envio é protegido por lock e sempre em MAVLink 1.
 """
 from __future__ import annotations
 
 import math
+import os
 import re
 import threading
 import time
 from collections import deque
+from types import ModuleType
 from typing import Any, Callable
 
 import numpy as np
 from pymavlink import mavutil
 
-from . import ardu32, magfit
+from . import ardu4, ardu32, magfit
 
 M = mavutil.mavlink
 SENSOR_NAMES = {k: v.name.replace("MAV_SYS_STATUS_", "") for k, v in M.enums["MAV_SYS_STATUS_SENSOR"].items() if k < (1 << 30)}
+PREARM_BIT = 0x10000000  # MAV_SYS_STATUS_PREARM_CHECK (4.x): saudável = passa no PreArm
+ACCELCAL_POS = {1: "level", 2: "left", 3: "right", 4: "nose_down", 5: "nose_up", 6: "back"}
+ACCELCAL_SUCCESS, ACCELCAL_FAILED = 16777215, 16777216
 
 
 class VehicleError(RuntimeError):
@@ -37,9 +48,21 @@ class Vehicle:
         self._running = False
         self._listeners: list[Callable[[Any], None]] = []
         self.reset_state()
-        self.accel = AccelCal(self)
-        self.compass = CompassCal(self)
+        self.accel32, self.accel4 = AccelCal(self), AccelCal4(self)
+        self.compass32, self.compass4 = CompassCal(self), CompassCal4(self)
         self.rc = RcCal(self)
+
+    @property
+    def is4(self) -> bool:
+        return self.profile is ardu4
+
+    @property
+    def accel(self) -> AccelCal:
+        return self.accel4 if self.is4 else self.accel32
+
+    @property
+    def compass(self) -> CompassCal | CompassCal4:
+        return self.compass4 if self.is4 else self.compass32
 
     # ------------------------------------------------------------------ estado
     def reset_state(self) -> None:
@@ -56,14 +79,18 @@ class Vehicle:
         self.connected_at = 0.0
         self.firmware: str | None = None
         self.frame_text: str | None = None
+        self.board_text: str | None = None
         self.last_ack: dict[int, Any] = {}
+        self.profile: ModuleType = ardu32
+        self.version: tuple[int, int, int] | None = None
+        self.saw_v2 = False
 
     @property
     def connected(self) -> bool:
         if self.conn is None:
             return False
         # durante a calibração do acelerômetro o 3.2 fica bloqueado e para de mandar heartbeat
-        if self.accel.state in ("starting", "waiting", "measuring"):
+        if not self.is4 and self.accel32.state in ("starting", "waiting", "measuring"):
             return True
         return time.time() - self.last_hb < 3.5
 
@@ -81,18 +108,38 @@ class Vehicle:
         except Exception as e:  # noqa: BLE001
             self.conn = None
             raise VehicleError(f"Não consegui abrir {port}: {e}") from e
+        # a APM 2.x só entende MAVLink 1; a Pixhawk aceita os dois
+        send = self.conn.mav.send
+        self.conn.mav.send = lambda msg, force_mavlink1=False: send(msg, force_mavlink1=True)
         self._running = True
         self._thread = threading.Thread(target=self._loop, name="mavlink-rx", daemon=True)
         self._thread.start()
         self.connected_at = time.time()
-        # abrir a USB reseta o ATmega2560 (DTR); espera heartbeat e o fim do boot
+        # na APM, abrir a USB reseta o ATmega2560 (DTR): o heartbeat só vem depois do boot
         if not self._wait(lambda: self.last_hb > 0, 15):
             self.disconnect()
             raise VehicleError("Sem heartbeat. Confira a porta, o baud (115200 na USB) e se outro programa está usando a serial.")
-        self._wait(lambda: any("GROUND START" in t for _, _, t in self.texts), 8)
-        time.sleep(0.5)
-        self.request_streams(ardu32.DEFAULT_STREAM_HZ)
+        self._detect_profile()
+        if not self.is4:
+            self._wait(lambda: any("GROUND START" in t for _, _, t in self.texts), 8)
+            time.sleep(0.5)
+        self.request_streams(self.profile.DEFAULT_STREAM_HZ)
         self.fetch_params_async()
+        if self.is4:
+            self.command_long(M.MAV_CMD_RUN_PREARM_CHECKS)
+
+    def _detect_profile(self) -> None:
+        """4.x responde AUTOPILOT_VERSION e fala MAVLink 2; o 3.2 não faz nenhum dos dois de forma confiável."""
+        self.command_long(M.MAV_CMD_REQUEST_MESSAGE, M.MAVLINK_MSG_ID_AUTOPILOT_VERSION)
+        self.command_long(M.MAV_CMD_REQUEST_AUTOPILOT_CAPABILITIES, 1)
+        self._wait(lambda: self.version is not None, 2.5)
+        self._update_profile()
+
+    def _update_profile(self) -> None:
+        if self.version:
+            self.profile = ardu4 if self.version[0] >= 4 else ardu32
+        elif self.saw_v2 or "FRAME_CLASS" in self.params:
+            self.profile = ardu4
 
     def disconnect(self) -> None:
         self._running = False
@@ -104,19 +151,33 @@ class Vehicle:
             except Exception:  # noqa: BLE001
                 pass
         self.conn = None
-        self.accel.reset()
-        self.compass.reset()
-        self.rc.reset()
+        for cal in (self.accel32, self.accel4, self.compass32, self.compass4, self.rc):
+            cal.reset()
 
     def reboot(self) -> None:
-        """Reinicia a placa. Na USB fechar/abrir a serial já reseta (DTR); o comando cobre o caso da telemetria."""
+        """Reinicia a placa e reconecta. Na USB da APM fechar/abrir a serial já reseta (DTR)."""
         if self.conn is None:
             raise VehicleError("Não conectado.")
         self.require_disarmed()
-        port, baud = self.port, self.baud
+        port, baud, is4 = self.port, self.baud, self.is4
         self.command_long(M.MAV_CMD_PREFLIGHT_REBOOT_SHUTDOWN, 1)
         time.sleep(0.5)
-        self.connect(port, baud)
+        if not is4:
+            self.connect(port, baud)
+            return
+        # a USB da Pixhawk some e volta (~3–8 s) quando ela reinicia
+        self.disconnect()
+        self._wait(lambda: not os.path.exists(port), 5)
+        t0, err = time.time(), None
+        while time.time() - t0 < 25:
+            if os.path.exists(port):
+                try:
+                    self.connect(port, baud)
+                    return
+                except VehicleError as e:
+                    err = e
+            time.sleep(1)
+        raise err or VehicleError("A placa não voltou na USB depois de reiniciar.")
 
     # ------------------------------------------------------------------ RX
     def _loop(self) -> None:
@@ -131,7 +192,11 @@ class Vehicle:
             t = msg.get_type()
             if t == "BAD_DATA":
                 continue
+            if msg.get_srcSystem() == 255:  # eco de outro GCS
+                continue
             now = time.time()
+            if not self.saw_v2 and msg.get_msgbuf()[:1] == b"\xfd":
+                self.saw_v2 = True
             with self._state_lock:
                 self.msgs[t] = msg
                 self.msg_time[t] = now
@@ -143,18 +208,30 @@ class Vehicle:
                 self._on_param(msg, now)
             elif t == "COMMAND_ACK":
                 self.last_ack[msg.command] = (now, msg.result)
+            elif t == "COMMAND_LONG":  # a placa 4.x pede a posição do acelerômetro assim
+                self.accel4.on_command_long(msg)
+            elif t == "AUTOPILOT_VERSION":
+                v = msg.flight_sw_version
+                self.version = ((v >> 24) & 0xFF, (v >> 16) & 0xFF, (v >> 8) & 0xFF)
             elif t == "RAW_IMU":
-                self.compass.on_raw_imu(msg)
-            elif t == "RC_CHANNELS_RAW":
+                self.compass32.on_raw_imu(msg)
+            elif t in ("MAG_CAL_PROGRESS", "MAG_CAL_REPORT"):
+                self.compass4.on_msg(msg)
+            elif t in ("RC_CHANNELS_RAW", "RC_CHANNELS"):
                 self.rc.on_rc(msg)
 
     def _on_text(self, now: float, sev: int, text: str) -> None:
         text = text.strip("\x00").strip()
         self.texts.append((now, sev, text))
-        if re.search(r"(APM:Copter|ArduCopter)\s*V?\d", text):
+        if (fw := re.search(r"(APM:Copter|ArduCopter)\s*V?(\d+)\.(\d+)\.?(\d*)", text)):
             self.firmware = text
+            if self.version is None:
+                self.version = (int(fw[2]), int(fw[3]), int(fw[4] or 0))
+                self._update_profile()
         elif text.startswith("Frame:"):
             self.frame_text = text.split(":", 1)[1].strip()
+        elif re.match(r"(fmu|Pixhawk|CubeBlack|MatekH|omnibus)", text, re.I) and self.board_text is None:
+            self.board_text = text.split()[0]
         self.accel.on_text(text)
 
     def _on_param(self, msg: Any, now: float) -> None:
@@ -228,6 +305,7 @@ class Vehicle:
                     quiet_since = time.time()
         finally:
             self.params_loading = False
+            self._update_profile()
 
     def set_param(self, name: str, value: float, timeout: float = 2.0, retries: int = 3) -> float:
         """Grava e confere a leitura de volta. Retorna o valor lido."""
@@ -257,11 +335,25 @@ class Vehicle:
 
     # -------------------------------------------------------------- snapshot
     def prearm(self) -> dict:
-        """O 3.2 reenvia as falhas de PreArm periodicamente (~30 s) enquanto desarmado."""
+        """As duas famílias reenviam as falhas de PreArm a cada ~30 s enquanto desarmadas.
+
+        O 4.x também diz em SYS_STATUS se passa no PreArm, então o resultado sai na hora.
+        """
         now = time.time()
         recent = sorted({t for ts, _, t in self.texts if t.startswith("PreArm") and now - ts < 40})
         watched = now - self.connected_at if self.connected_at else 0
-        return {"messages": recent, "watched_s": round(watched), "conclusive": watched > 40}
+        out = {"messages": recent, "watched_s": round(watched), "conclusive": watched > 40, "ok": None}
+        s = self.msgs.get("SYS_STATUS")
+        if self.is4 and s and s.onboard_control_sensors_present & PREARM_BIT:
+            out["ok"] = bool(s.onboard_control_sensors_health & PREARM_BIT)
+            out["conclusive"] = True
+            if out["ok"]:
+                out["messages"] = []
+        return out
+
+    def run_prearm_checks(self) -> None:
+        if self.is4:
+            self.command_long(M.MAV_CMD_RUN_PREARM_CHECKS)
 
     def snapshot(self) -> dict:
         m = self.msgs
@@ -271,8 +363,11 @@ class Vehicle:
             "port": self.port,
             "baud": self.baud,
             "hb_age": round(time.time() - self.last_hb, 1) if self.last_hb else None,
-            "firmware": self.firmware,
+            "firmware": self.firmware or (f"ArduCopter V{'.'.join(map(str, self.version))}" if self.version else None),
             "frame_text": self.frame_text,
+            "board": self.profile.KEY,
+            "board_label": self.profile.LABEL,
+            "board_text": self.board_text,
             "params": {"received": len(self.param_indices), "total": self.param_count, "loading": self.params_loading},
             "texts": [{"t": ts, "sev": s, "text": tx} for ts, s, tx in list(self.texts)[-40:]],
             "prearm": self.prearm(),
@@ -282,7 +377,7 @@ class Vehicle:
         }
         if hb:
             snap["armed"] = bool(hb.base_mode & M.MAV_MODE_FLAG_SAFETY_ARMED)
-            snap["mode"] = ardu32.FLIGHT_MODES.get(hb.custom_mode, str(hb.custom_mode))
+            snap["mode"] = self.profile.FLIGHT_MODES.get(hb.custom_mode, str(hb.custom_mode))
             snap["custom_mode"] = hb.custom_mode
             snap["system_status"] = M.enums["MAV_STATE"][hb.system_status].name.replace("MAV_STATE_", "") if hb.system_status in M.enums["MAV_STATE"] else hb.system_status
         if (s := m.get("SYS_STATUS")):
@@ -292,9 +387,15 @@ class Vehicle:
             ]
             snap["load_pct"] = s.load / 10
             snap["battery"] = {"voltage": s.voltage_battery / 1000, "current": s.current_battery / 100 if s.current_battery >= 0 else None, "remaining": s.battery_remaining}
+            if self.is4:
+                # 4.x liga o bit de saídas de motor quando a chave de segurança está liberada
+                snap["safety_off"] = bool(s.onboard_control_sensors_enabled & M.MAV_SYS_STATUS_SENSOR_MOTOR_OUTPUTS)
         if (h := m.get("HWSTATUS")):
             snap["vcc"] = h.Vcc / 1000
             snap["i2c_err"] = h.I2Cerr
+        elif (ps := m.get("POWER_STATUS")):
+            snap["vcc"] = ps.Vcc / 1000
+            snap["vservo"] = ps.Vservo / 1000
         if (a := m.get("ATTITUDE")):
             snap["attitude"] = {"roll": math.degrees(a.roll), "pitch": math.degrees(a.pitch), "yaw": math.degrees(a.yaw)}
         if (r := m.get("RAW_IMU")):
@@ -306,9 +407,12 @@ class Vehicle:
             snap["hud"] = {"alt": v.alt, "heading": v.heading, "throttle": v.throttle, "climb": v.climb}
         if (g := m.get("GPS_RAW_INT")):
             snap["gps"] = {"fix": g.fix_type, "sats": g.satellites_visible, "hdop": g.eph / 100 if g.eph != 65535 else None, "lat": g.lat / 1e7, "lon": g.lon / 1e7}
-        if (rc := m.get("RC_CHANNELS_RAW")):
+        rc_t = "RC_CHANNELS" if "RC_CHANNELS" in m else "RC_CHANNELS_RAW"
+        if (rc := m.get(rc_t)):
             snap["rc"] = [getattr(rc, f"chan{i}_raw") for i in range(1, 9)]
-            snap["rc_age"] = round(time.time() - self.msg_time["RC_CHANNELS_RAW"], 1)
+            snap["rc_age"] = round(time.time() - self.msg_time[rc_t], 1)
+            # 4.x sem receptor: chancount = 0 e canais em 0. APM 2.x sem receptor: CH3 ≈ 900
+            snap["rc_count"] = getattr(rc, "chancount", None)
         if (so := m.get("SERVO_OUTPUT_RAW")):
             snap["servo"] = [getattr(so, f"servo{i}_raw") for i in range(1, 9)]
         if (mi := m.get("MEMINFO")):
@@ -463,7 +567,7 @@ class CompassCal:
     def stop(self) -> dict:
         if self.state != "collecting":
             raise VehicleError("A coleta não está ativa.")
-        self.v.request_streams(ardu32.DEFAULT_STREAM_HZ, M.MAV_DATA_STREAM_RAW_SENSORS)
+        self.v.request_streams(self.v.profile.DEFAULT_STREAM_HZ, M.MAV_DATA_STREAM_RAW_SENSORS)
         if len(self.samples) < 50:
             self.state = "idle"
             raise VehicleError(f"Poucas amostras ({len(self.samples)}). Gire o drone por pelo menos 60 s.")
@@ -528,12 +632,12 @@ class RcCal:
         """Sticks no centro e throttle embaixo: grava o trim."""
         if self.state != "capturing":
             raise VehicleError("A captura não está ativa.")
-        rc = self.v.msgs.get("RC_CHANNELS_RAW")
+        rc = self.v.msgs.get("RC_CHANNELS") or self.v.msgs.get("RC_CHANNELS_RAW")
         if rc is None:
             raise VehicleError("Sem dados de rádio.")
         cur = [getattr(rc, f"chan{i}_raw") for i in range(1, 9)]
         self.trims = cur
-        self.v.request_streams(ardu32.DEFAULT_STREAM_HZ, M.MAV_DATA_STREAM_RC_CHANNELS)
+        self.v.request_streams(self.v.profile.DEFAULT_STREAM_HZ, M.MAV_DATA_STREAM_RC_CHANNELS)
         self.state = "captured"
         return self.status()
 
@@ -562,3 +666,145 @@ class RcCal:
 
     def status(self) -> dict:
         return {"state": self.state, "mins": self.mins, "maxs": self.maxs, "trims": self.trims}
+
+
+# ================================================== calibrações do ArduCopter 4.x
+class AccelCal4(AccelCal):
+    """6 posições feitas pela placa. Ela pede cada posição com COMMAND_LONG(ACCELCAL_VEHICLE_POS)
+    e o GCS confirma mandando o mesmo comando com a posição. A placa não trava (heartbeat continua).
+    """
+
+    _pos_code = 0  # código ACCELCAL_VEHICLE_POS que a placa pediu por último
+
+    def start(self) -> None:
+        if self.state in ("starting", "waiting", "measuring"):
+            raise VehicleError("A calibração já está em andamento.")
+        if not self.v.connected:
+            raise VehicleError("Não conectado.")
+        self.v.require_disarmed()
+        self.reset()
+        self.before = {n: self.v.params.get(n) for n in self.NAMES}
+        self.state = "starting"
+        self._pos_code = 0
+        self.v.command_long(M.MAV_CMD_PREFLIGHT_CALIBRATION, 0, 0, 0, 0, 1, 0, 0)
+
+    def next(self) -> None:
+        if self.state != "waiting":
+            raise VehicleError("A placa não está esperando uma posição agora.")
+        self.state = "measuring"
+        self._ack_t = time.time()
+        self.v.command_long(M.MAV_CMD_ACCELCAL_VEHICLE_POS, self._pos_code)
+
+    def _ask(self, code: int, prompt: str | None) -> None:
+        self._pos_code = code
+        self.position = ACCELCAL_POS[code]
+        self.step = self.ORDER.index(self.position) + 1
+        if prompt:
+            self.firmware_prompt = prompt
+        self.state = "waiting"
+
+    def on_command_long(self, msg: Any) -> None:
+        if msg.command != M.MAV_CMD_ACCELCAL_VEHICLE_POS or self.state not in ("starting", "waiting", "measuring"):
+            return
+        code = int(msg.param1)
+        if code in ACCELCAL_POS:
+            self._ask(code, self.firmware_prompt if self.state == "waiting" else None)
+        elif code == ACCELCAL_SUCCESS:
+            self.state = "success"
+            threading.Thread(target=self._read_result, daemon=True).start()
+        elif code == ACCELCAL_FAILED:
+            self.state = "failed"
+
+    def on_text(self, text: str) -> None:
+        if self.state not in ("starting", "waiting", "measuring"):
+            return
+        self.log.append(text)
+        if text.startswith("Place vehicle"):
+            # o texto chega junto com o COMMAND_LONG; serve de reserva se o comando se perder
+            pos = next((k for f, k in self.KEYS if f in text), None)
+            code = next((c for c, k in ACCELCAL_POS.items() if k == pos), 0)
+            if code:
+                self._ask(code, text)
+        elif "successful" in text.lower():
+            self.state = "success"
+            threading.Thread(target=self._read_result, daemon=True).start()
+        elif "failed" in text.lower():
+            self.state = "failed"
+
+
+class CompassCal4:
+    """Calibração feita pela placa (MAV_CMD_DO_START_MAG_CAL). Ajusta elipsoide e detecta a
+    orientação de cada bússola; o GCS só mostra o progresso e confirma o resultado.
+    """
+
+    def __init__(self, v: Vehicle) -> None:
+        self.v = v
+        self.reset()
+
+    def reset(self) -> None:
+        self.state = "idle"  # idle|running|done|failed|accepted
+        self.progress: dict[int, dict] = {}
+        self.reports: dict[int, dict] = {}
+        self.started = 0.0
+
+    def start(self) -> None:
+        if not self.v.connected:
+            raise VehicleError("Não conectado.")
+        self.v.require_disarmed()
+        s = self.v.msgs.get("SYS_STATUS")
+        if not s or not (s.onboard_control_sensors_present & M.MAV_SYS_STATUS_SENSOR_3D_MAG):
+            raise VehicleError("A placa não detectou bússola. Ligue COMPASS_ENABLE=1, conecte o módulo e reinicie a placa.")
+        self.reset()
+        # p1 máscara (0 = todas), p2 tentar de novo, p3 gravar sozinho, p4 atraso, p5 reiniciar sozinho
+        res = self.v.command_wait_ack(M.MAV_CMD_DO_START_MAG_CAL, 0, 0, 0, 0, 0, timeout=3)
+        if res not in (None, M.MAV_RESULT_ACCEPTED):
+            removed = any("removed" in t and t.startswith("Mag:") for _, _, t in self.v.texts)
+            raise VehicleError("A placa recusou a calibração: uma bússola da lista de prioridade não está ligada. "
+                               "Use \"Usar as bússolas presentes e reiniciar\" e tente de novo." if removed
+                               else f"A placa recusou a calibração (resultado {res}).")
+        self.state = "running"
+        self.started = time.time()
+
+    def on_msg(self, msg: Any) -> None:
+        if self.state not in ("running", "done", "failed"):
+            return
+        cid = msg.compass_id
+        if msg.get_type() == "MAG_CAL_PROGRESS":
+            if self.state == "running":
+                mask = bytes(msg.completion_mask) if not isinstance(msg.completion_mask, (bytes, bytearray)) else msg.completion_mask
+                self.progress[cid] = {"id": cid, "pct": msg.completion_pct, "status": msg.cal_status, "attempt": msg.attempt,
+                                      "cells": [bool(b >> i & 1) for b in mask for i in range(8)]}
+            return
+        st = msg.cal_status
+        self.reports[cid] = {
+            "id": cid, "status": st, "ok": st == M.MAG_CAL_SUCCESS, "fitness": round(msg.fitness, 1),
+            "offsets": [round(msg.ofs_x), round(msg.ofs_y), round(msg.ofs_z)],
+            "diag": [round(msg.diag_x, 3), round(msg.diag_y, 3), round(msg.diag_z, 3)],
+            "scale": round(getattr(msg, "scale_factor", 0) or 0, 3), "autosaved": bool(msg.autosaved),
+            "orientation": getattr(msg, "new_orientation", None), "orientation_confidence": round(getattr(msg, "orientation_confidence", 0) or 0, 2),
+            "message": M.enums["MAG_CAL_STATUS"][st].name.replace("MAG_CAL_", "") if st in M.enums["MAG_CAL_STATUS"] else str(st),
+        }
+        if set(self.progress) <= set(self.reports):
+            self.state = "done" if all(r["ok"] for r in self.reports.values()) else "failed"
+
+    def accept(self) -> dict:
+        if self.state != "done":
+            raise VehicleError("Nada para gravar: a calibração não terminou com sucesso.")
+        res = self.v.command_wait_ack(M.MAV_CMD_DO_ACCEPT_MAG_CAL, 0, timeout=4)
+        if res not in (None, M.MAV_RESULT_ACCEPTED):
+            raise VehicleError(f"A placa recusou gravar (resultado {res}).")
+        self.state = "accepted"
+        self.v.fetch_params_async()
+        return self.status()
+
+    def cancel(self) -> None:
+        if self.state == "running" and self.v.conn is not None:
+            self.v.command_long(M.MAV_CMD_DO_CANCEL_MAG_CAL, 0)
+        self.reset()
+
+    def status(self) -> dict:
+        st: dict[str, Any] = {"state": self.state, "progress": sorted(self.progress.values(), key=lambda p: p["id"]),
+                              "reports": sorted(self.reports.values(), key=lambda r: r["id"])}
+        if self.state == "running":
+            st["elapsed"] = round(time.time() - self.started)
+        return st

@@ -1,4 +1,8 @@
 """Constantes do ArduCopter 3.2.x (último firmware suportado pela APM 2.x)."""
+import re
+
+KEY = "ac32"
+LABEL = "APM 2.x · ArduCopter 3.2"
 
 # custom_mode do HEARTBEAT
 FLIGHT_MODES: dict[int, str] = {
@@ -13,6 +17,7 @@ FLTMODE_PWM = [(0, 1230), (1231, 1360), (1361, 1490), (1491, 1620), (1621, 1749)
 
 # FRAME: só X e + têm diagrama de motores
 FRAMES = {0: "PLUS", 1: "X", 2: "V", 3: "H", 4: "V-TAIL", 10: "Y6B"}
+FRAME_PARAM = "FRAME"
 
 # ordem do teste de motores (A, B, C, D = sentido horário a partir da frente)
 # -> (nome, posição, sentido de giro) para cada letra
@@ -49,6 +54,7 @@ PARAMS_SKIP_RESTORE = {
 }
 # Taxas de telemetria: a estação de solo ajusta sozinha; um backup com 0 deixaria a placa muda.
 PARAMS_SKIP_RESTORE_PREFIX = ("SR0_", "SR1_", "SR2_")
+PARAMS_SKIP_RESTORE_RE = re.compile(r"(?!)")  # nenhum
 
 # Presets de configuração conforme a escolha GPS / sem GPS
 PRESETS: dict[str, dict[str, float]] = {
@@ -64,7 +70,15 @@ PRESETS: dict[str, dict[str, float]] = {
 PRESET_NEEDS_REBOOT = {"MAG_ENABLE"}
 
 # Sensor de corrente/tensão "Power Module" da APM 2.5/2.6
-APM2_POWER_MODULE = {"BATT_VOLT_PIN": 13, "BATT_CURR_PIN": 12, "BATT_VOLT_MULT": 10.1, "BATT_AMP_PERVOLT": 17.0}
+POWER_MODULE = {"BATT_VOLT_PIN": 13, "BATT_CURR_PIN": 12, "BATT_VOLT_MULT": 10.1, "BATT_AMP_PERVOLT": 17.0}
+
+BATTERY = {
+    "amp": "BATT_AMP_PERVOLT", "fs_enable": "FS_BATT_ENABLE", "fs_volt": "FS_BATT_VOLTAGE", "fs_mah": "FS_BATT_MAH",
+    "fs_options": {0: "desligado", 1: "LAND", 2: "RTL"},
+    "reboot_note": "",
+}
+FS_THR_OPTIONS = {0: "desligado", 1: "RTL (volta para casa)", 2: "continua missão em AUTO", 3: "sempre LAND"}
+ESC_PARAMS = ["ESC", "MOT_SPIN_ARMED", "THR_MIN", "THR_MAX", "RC3_MIN", "RC3_MAX"]
 
 # Taxa de telemetria padrão. O 3.2 grava em SR0_* a taxa pedida via REQUEST_DATA_STREAM,
 # então sempre pedimos o valor original de fábrica para não deixar a placa "muda".
